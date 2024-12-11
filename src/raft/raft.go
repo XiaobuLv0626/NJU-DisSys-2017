@@ -194,7 +194,6 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 			rf.persist()
 		}
 		reply.Term = rf.currentTerm
-		reply.VoteGranted = voted_granted
 		return
 	}
 	// if candidate's term > currentTerm, then receiver is naturally follower. Update currentTerm and grant vote
@@ -211,7 +210,6 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = voted_granted
 		return
 	}
-
 }
 
 // example AppendEntries RPC arguments structure.
@@ -234,27 +232,76 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// reply false if term < currentTerm
+	// Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
-	// reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
-	if len(rf.log) < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		reply.Term = rf.currentTerm
-		reply.Success = false
-		return
+	// If term > currentTerm, update currentTerm and convert to follower
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		rf.state = 0 // follower
 	}
-	// if an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
-	rf.log = rf.log[:args.PrevLogIndex+1]
-	rf.log = append(rf.log, args.Entries...)
-	// if leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
-	}
+	// Reply false if log doesn’t contain an entry at prevLogIndex
+	// whose term matches prevLogTerm
+	//if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	//	reply.Term = rf.currentTerm
+	//	reply.Success = false
+	//	return
+	//}
+	//// If an existing entry conflicts with a new one (same index but different terms),
+	//// delete the existing entry and all that follow it
+	//rf.log = rf.log[:args.PrevLogIndex+1]
+	//// Append any new entries not already in the log
+	//rf.log = append(rf.log, args.Entries...)
+	//// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	//if args.LeaderCommit > rf.commitIndex {
+	//	rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+	//}
 	reply.Term = rf.currentTerm
 	reply.Success = true
+}
+
+func (rf *Raft) handleAppendEntries(server int, reply AppendEntriesReply) {
+	//
+}
+
+func (rf *Raft) handleVoteResult(reply RequestVoteReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// for reply term older than currentTerm, just ignore
+	if reply.Term < rf.currentTerm {
+		return
+	}
+	// for reply term newer than currentTerm, became follower
+	if reply.Term > rf.currentTerm {
+		rf.state = 0 // follower
+		rf.currentTerm = reply.Term
+		rf.votedFor = -1
+		rf.resetTimer()
+		return
+	}
+	// if reply term == currentTerm and this vote is for server
+	if reply.Term == rf.currentTerm {
+		if rf.state == 1 && reply.VoteGranted {
+			rf.votesCount += 1
+			// if server get majority vote, become a leader
+			if rf.votesCount >= len(rf.peers)/2+1 {
+				rf.state = 2 // Leader
+				for i := range rf.peers {
+					if i == rf.me {
+						continue
+					}
+					rf.nextIndex[i] = len(rf.log)
+					rf.matchIndex[i] = -1
+				}
+				rf.resetTimer()
+			}
+		}
+		return
+	}
 }
 
 func (rf *Raft) resendAppendEntries() {
@@ -280,7 +327,7 @@ func (rf *Raft) resendAppendEntries() {
 	}
 }
 
-func (rf *Raft) resendRequestVote() bool {
+func (rf *Raft) resendRequestVote() {
 	// reset raft peer status
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
@@ -288,7 +335,6 @@ func (rf *Raft) resendRequestVote() bool {
 	rf.state = 1 // candidate
 	rf.persist()
 	// resend RequestVote
-	retVal := false
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
@@ -306,10 +352,8 @@ func (rf *Raft) resendRequestVote() bool {
 					rf.handleVoteResult(reply)
 				}
 			}(server, args)
-			retVal = true
 		}
 	}
-	return retVal
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -333,7 +377,7 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 }
 
 func (rf *Raft) sendAppendEntry(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
