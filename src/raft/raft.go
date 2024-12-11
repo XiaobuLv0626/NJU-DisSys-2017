@@ -20,10 +20,8 @@ package raft
 import (
 	"bytes"
 	"encoding/gob"
-	"fmt"
 	"labrpc"
 	"math/rand"
-	"strconv"
 	"sync"
 	"time"
 )
@@ -182,13 +180,12 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 		return
 	}
-	voted_granted := true
+	reply.VoteGranted = true
 	// grant vote if candidate's log is at least as up-to-date as receiver's log and votedFor is null or candidateId
 	if len(rf.log) > 0 {
-		if args.LastLogTerm < rf.log[len(rf.log)-1].Term {
-			voted_granted = false
-		} else if args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex < len(rf.log)-1 {
-			voted_granted = false
+		if args.LastLogTerm < rf.log[len(rf.log)-1].Term ||
+			(args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex < len(rf.log)-1) {
+			reply.VoteGranted = false
 		}
 	}
 
@@ -198,14 +195,13 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 			rf.persist()
 		}
 		reply.Term = rf.currentTerm
-		reply.VoteGranted = voted_granted
 		return
 	}
 	// if candidate's term > currentTerm, then receiver is naturally follower. Update currentTerm and grant vote
 	if args.Term > rf.currentTerm {
 		rf.state = 0 // follower
 		rf.currentTerm = args.Term
-		if voted_granted {
+		if reply.VoteGranted {
 			rf.votedFor = args.CandidateId
 			rf.persist()
 		} else {
@@ -213,7 +209,6 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		}
 		rf.resetTimer()
 		reply.Term = rf.currentTerm
-		reply.VoteGranted = voted_granted
 		return
 	}
 }
@@ -230,14 +225,17 @@ type AppendEntriesArgs struct {
 
 // example AppendEntries RPC reply structure.
 type AppendEntriesReply struct {
-	Term    int  // currentTerm, for leader to update itself
-	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+	Term        int  // currentTerm, for leader to update itself
+	Success     bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+	CommitIndex int  //
 }
 
 // AppendEntries RPC handler.
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
+	defer rf.resetTimer()
 
 	reply.Success = false
 	reply.Term = rf.currentTerm
@@ -253,13 +251,92 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		rf.votedFor = -1
 	}
 	reply.Term = args.Term
-
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+	if args.PrevLogIndex >= 0 && (args.PrevLogIndex > len(rf.log)-1 || args.PrevLogTerm != rf.log[args.PrevLogIndex].Term) {
+		index := min(len(rf.log)-1, args.PrevLogIndex)
+		for index >= 0 {
+			if args.PrevLogTerm == rf.log[index].Term {
+				break
+			}
+			index -= 1
+		}
+		reply.CommitIndex = index
+		return
+	}
+	reply.Success = true
+	if args.Entries == nil {
+		if len(rf.log) > args.LeaderCommit {
+			rf.commitIndex = args.LeaderCommit
+			go rf.commitEntries()
+		}
+		reply.CommitIndex = args.PrevLogIndex
+	} else {
+		rf.log = rf.log[:args.PrevLogIndex+1]
+		rf.log = append(rf.log, args.Entries...)
+		if len(rf.log) > args.LeaderCommit {
+			rf.commitIndex = args.LeaderCommit
+			go rf.commitEntries()
+		}
+		reply.CommitIndex = len(rf.log) - 1
+	}
+}
 
+func (rf *Raft) commitEntries() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	index := rf.lastApplied + 1
+	for index <= rf.commitIndex {
+		args := ApplyMsg{
+			Index:   index + 1,
+			Command: rf.log[index].Command,
+		}
+		rf.applyCh <- args
+		index += 1
+	}
+	rf.lastApplied = rf.commitIndex
 }
 
 func (rf *Raft) handleAppendEntries(server int, reply AppendEntriesReply) {
-	//
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// if server is not leader, return.
+	if rf.state != 2 {
+		return
+	}
+	// if reply > server.currentTerm, downgrade reply to follower
+	if reply.Term > rf.currentTerm {
+		rf.state = 0
+		rf.currentTerm = reply.Term
+		rf.votedFor = -1
+		rf.resetTimer()
+		return
+	}
+	// If AppendEntries fails because of login consistency: decrement nextIndex and retry
+	if reply.Success == false {
+		rf.nextIndex[server] = reply.CommitIndex + 1
+		rf.resendAppendEntries()
+	} else {
+		//If successful: update nextIndex and matchIndex for follower
+		rf.nextIndex[server] = reply.CommitIndex + 1
+		rf.matchIndex[server] = reply.CommitIndex
+		matchCount := 1
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				continue
+			}
+			if rf.matchIndex[i] >= rf.matchIndex[server] {
+				matchCount++
+			}
+		}
+		if matchCount < len(rf.peers)/2+1 {
+			return
+		}
+		if rf.commitIndex < rf.matchIndex[server] && rf.currentTerm == rf.log[rf.matchIndex[server]].Term {
+			rf.commitIndex = rf.matchIndex[server]
+			go rf.commitEntries()
+		}
+	}
 }
 
 func (rf *Raft) handleVoteResult(reply RequestVoteReply) {
@@ -310,6 +387,12 @@ func (rf *Raft) resendAppendEntries() {
 			PrevLogIndex: rf.nextIndex[i] - 1,
 			LeaderCommit: rf.commitIndex,
 		}
+		if args.PrevLogIndex >= 0 {
+			args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+		}
+		if rf.nextIndex[i] < len(rf.log) {
+			args.Entries = rf.log[rf.nextIndex[i]:]
+		}
 		go func(server int, args AppendEntriesArgs) {
 			var reply AppendEntriesReply
 			ok := rf.sendAppendEntry(server, args, &reply)
@@ -327,7 +410,7 @@ func (rf *Raft) resendRequestVote() {
 	rf.votesCount = 1
 	rf.state = 1 // candidate
 	rf.persist()
-	fmt.Printf("\ncandidate:" + strconv.Itoa(rf.me) + " " + strconv.Itoa(rf.currentTerm))
+	// fmt.Printf("\ncandidate:" + strconv.Itoa(rf.me) + " " + strconv.Itoa(rf.currentTerm))
 	// resend RequestVote
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
