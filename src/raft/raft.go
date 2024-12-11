@@ -20,8 +20,10 @@ package raft
 import (
 	"bytes"
 	"encoding/gob"
+	"fmt"
 	"labrpc"
 	"math/rand"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -36,7 +38,9 @@ const (
 )
 
 func randTimeout() time.Duration {
-	return time.Duration(electionMinTimeout+rand.Intn(electionMaxTimeout-electionMinTimeout)) * time.Millisecond
+	timer := electionMinTimeout + rand.Intn(electionMaxTimeout-electionMinTimeout)
+	// fmt.Printf("\ntimer:" + strconv.Itoa(timer))
+	return time.Duration(timer) * time.Millisecond
 }
 
 // log entry contains command for state machine, and term when entry
@@ -194,6 +198,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 			rf.persist()
 		}
 		reply.Term = rf.currentTerm
+		reply.VoteGranted = voted_granted
 		return
 	}
 	// if candidate's term > currentTerm, then receiver is naturally follower. Update currentTerm and grant vote
@@ -206,6 +211,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		} else {
 			rf.votedFor = -1
 		}
+		rf.resetTimer()
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = voted_granted
 		return
@@ -232,36 +238,24 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	reply.Success = false
+	reply.Term = rf.currentTerm
 	// Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
-		reply.Success = false
 		return
 	}
-	// If term > currentTerm, update currentTerm and convert to follower
+	// if receives an arg whose term is greater than server's, then
+	// set currentTerm = T, convert to follower
 	if args.Term > rf.currentTerm {
+		rf.state = 1
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
-		rf.state = 0 // follower
 	}
-	// Reply false if log doesn’t contain an entry at prevLogIndex
-	// whose term matches prevLogTerm
-	//if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-	//	reply.Term = rf.currentTerm
-	//	reply.Success = false
-	//	return
-	//}
-	//// If an existing entry conflicts with a new one (same index but different terms),
-	//// delete the existing entry and all that follow it
-	//rf.log = rf.log[:args.PrevLogIndex+1]
-	//// Append any new entries not already in the log
-	//rf.log = append(rf.log, args.Entries...)
-	//// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-	//if args.LeaderCommit > rf.commitIndex {
-	//	rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
-	//}
-	reply.Term = rf.currentTerm
-	reply.Success = true
+	reply.Term = args.Term
+
+	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+
 }
 
 func (rf *Raft) handleAppendEntries(server int, reply AppendEntriesReply) {
@@ -310,13 +304,12 @@ func (rf *Raft) resendAppendEntries() {
 			continue
 		}
 		// set AppendEntries
-		var args AppendEntriesArgs
-		args.Term = rf.currentTerm
-		args.LeaderId = rf.me
-		args.LeaderCommit = rf.commitIndex
-		args.PrevLogIndex = rf.nextIndex[i] - 1
-		args.LeaderCommit = rf.nextIndex[i] - 1
-
+		args := AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: rf.nextIndex[i] - 1,
+			LeaderCommit: rf.commitIndex,
+		}
 		go func(server int, args AppendEntriesArgs) {
 			var reply AppendEntriesReply
 			ok := rf.sendAppendEntry(server, args, &reply)
@@ -334,6 +327,7 @@ func (rf *Raft) resendRequestVote() {
 	rf.votesCount = 1
 	rf.state = 1 // candidate
 	rf.persist()
+	fmt.Printf("\ncandidate:" + strconv.Itoa(rf.me) + " " + strconv.Itoa(rf.currentTerm))
 	// resend RequestVote
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
@@ -393,12 +387,24 @@ func (rf *Raft) sendAppendEntry(server int, args AppendEntriesArgs, reply *Appen
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := rf.state == 2
+	// if this server is leader, start the agreement and return immediately
+	if isLeader {
+		newlog := LogEntry{
+			Command: command,
+			Term:    rf.currentTerm,
+		}
+		rf.log = append(rf.log, newlog)
 
+		term = rf.currentTerm
+		index = len(rf.log)
+		rf.persist()
+	}
 	return index, term, isLeader
-
 }
 
 // the tester calls Kill() when a Raft instance won't
@@ -411,6 +417,8 @@ func (rf *Raft) Kill() {
 
 // handler for follower/leader/candidate when their timer ran out
 func (rf *Raft) onTimeout() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	// Define the action to be performed when the timer reaches 0
 	switch rf.state {
 	case 0, 1: // follower and candidate: become candidate and start election
@@ -418,6 +426,8 @@ func (rf *Raft) onTimeout() {
 	case 2: // leader: send AppendEntries to all
 		rf.resendAppendEntries()
 	}
+	// Reset the timer
+	rf.resetTimer()
 }
 
 // when a timer ran out, set a new one
@@ -437,12 +447,11 @@ func (rf *Raft) resetTimer() {
 
 // the defined goroutine of each raft server
 func (rf *Raft) runTimer() {
+
 	for {
 		<-rf.timer.C
 		// Perform the action when the timer reaches 0
 		rf.onTimeout()
-		// Reset the timer
-		rf.resetTimer()
 	}
 }
 
